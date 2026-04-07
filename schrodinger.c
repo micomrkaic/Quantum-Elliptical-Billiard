@@ -1,33 +1,20 @@
 /*
- * schrodinger.c = 2D TDSE, elliptic hard-wall billiard
+ * schrodinger.c -- 2D TDSE, elliptic hard-wall billiard
  *
  * Modes (M to toggle):
- *   NUMERICAL = parallel ADI Crank-Nicolson
- *   ANALYTIC  = Mathieu eigenfunction expansion, exact time evolution
- *               Uses LAPACKE dsyev on small (~60=60) Hill matrices.
- *               No large sparse solvers needed.
+ *   NUMERICAL -- parallel ADI Crank-Nicolson (4 threads default)
+ *   ANALYTIC  -- Mathieu eigenfunction expansion via GSL, exact time evolution
  *
- * V = start/stop video (ffmpeg pipe -> output.mp4)
+ * C to compare solvers, V for video, R to reset, Space to pause.
  *
- * Build Linux:
- *   gcc -O2 -march=native -std=c17 -Wall -Wextra -DNTHREADS=4 \
- *       $(sdl2-config --cflags) schrodinger.c -o schrodinger \
- *       $(sdl2-config --libs) -llapacke -llapack -lblas -lm -lpthread
+ * Build (both platforms):   make [NTHREADS=N]
  *
- * Build macOS (SDL2 + OpenBLAS from Homebrew):
- *   brew install sdl2 openblas
- *   gcc -O2 -std=c17 -Wall -Wextra -DNTHREADS=10 \
- *       -I$(brew --prefix sdl2)/include/SDL2 \
- *       -I$(brew --prefix openblas)/include \
- *       schrodinger.c -o schrodinger \
- *       -L$(brew --prefix sdl2)/lib -lSDL2 \
- *       -L$(brew --prefix openblas)/lib -lopenblas \
- *       -lm -lpthread
+ * Linux deps:   sudo apt install libsdl2-dev libgsl-dev
+ * macOS deps:   brew install sdl2 gsl openblas
  */
 
 #define _GNU_SOURCE
 #include <SDL2/SDL.h>
-#include <lapacke.h>
 #include <gsl/gsl_sf_mathieu.h>
 #include <complex.h>
 #include <math.h>
@@ -36,6 +23,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <signal.h>
+#include <errno.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -165,7 +154,40 @@ static void thomas(const double complex *restrict a,
  * ================================================================== */
 typedef enum { PHASE_HS1, PHASE_HS2, PHASE_NORM, PHASE_EXIT } Phase;
 
-static pthread_barrier_t bar_start, bar_done;
+/* Portable barrier (pthread_barrier_t is absent on macOS).
+ * A barrier for N threads: all must call barrier_wait() before any proceed. */
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+    int             count;   /* threads still to arrive   */
+    int             total;   /* total threads per round   */
+    int             round;   /* generation counter        */
+} Barrier;
+
+static void barrier_init(Barrier *b, int n){
+    pthread_mutex_init(&b->mtx, NULL);
+    pthread_cond_init(&b->cv, NULL);
+    b->count = n; b->total = n; b->round = 0;
+}
+static void barrier_destroy(Barrier *b){
+    pthread_mutex_destroy(&b->mtx);
+    pthread_cond_destroy(&b->cv);
+}
+static void barrier_wait(Barrier *b){
+    pthread_mutex_lock(&b->mtx);
+    int r = b->round;
+    if (--b->count == 0){
+        b->round++;
+        b->count = b->total;
+        pthread_cond_broadcast(&b->cv);
+    } else {
+        while (b->round == r)
+            pthread_cond_wait(&b->cv, &b->mtx);
+    }
+    pthread_mutex_unlock(&b->mtx);
+}
+
+static Barrier          bar_start, bar_done;
 static volatile Phase    cur_phase;
 static volatile double complex g_rx, g_ry;
 static double            partial_norm[NTHREADS];
@@ -236,18 +258,18 @@ static void *worker(void *arg)
     int tid=((WorkerArg*)arg)->tid;
     int r0=tid*N/NTHREADS, r1=(tid+1)*N/NTHREADS;
     for(;;){
-        pthread_barrier_wait(&bar_start);
+        barrier_wait(&bar_start);
         Phase ph=cur_phase;
         if(ph==PHASE_EXIT) break;
         if      (ph==PHASE_HS1) do_hs1(r0,r1);
         else if (ph==PHASE_HS2) do_hs2(r0,r1);
         else if (ph==PHASE_NORM){
             partial_norm[tid]=do_norm_partial(r0,r1);
-            pthread_barrier_wait(&bar_done);
-            pthread_barrier_wait(&bar_start);
+            barrier_wait(&bar_done);
+            barrier_wait(&bar_start);
             do_norm_apply(r0,r1);
         }
-        pthread_barrier_wait(&bar_done);
+        barrier_wait(&bar_done);
     }
     return NULL;
 }
@@ -255,16 +277,16 @@ static void *worker(void *arg)
 static void dispatch(Phase ph)
 {
     cur_phase=ph;
-    pthread_barrier_wait(&bar_start);
-    pthread_barrier_wait(&bar_done);
+    barrier_wait(&bar_start);
+    barrier_wait(&bar_done);
 }
 
 static pthread_t threads[NTHREADS];
 
 static void threads_init(void)
 {
-    pthread_barrier_init(&bar_start,NULL,NTHREADS+1);
-    pthread_barrier_init(&bar_done, NULL,NTHREADS+1);
+    barrier_init(&bar_start,NTHREADS+1);
+    barrier_init(&bar_done, NTHREADS+1);
     for (int t=0;t<NTHREADS;t++){
         wargs[t].tid=t;
         pthread_create(&threads[t],NULL,worker,&wargs[t]);
@@ -274,10 +296,10 @@ static void threads_init(void)
 static void threads_stop(void)
 {
     cur_phase=PHASE_EXIT;
-    pthread_barrier_wait(&bar_start);
+    barrier_wait(&bar_start);
     for (int t=0;t<NTHREADS;t++) pthread_join(threads[t],NULL);
-    pthread_barrier_destroy(&bar_start);
-    pthread_barrier_destroy(&bar_done);
+    barrier_destroy(&bar_start);
+    barrier_destroy(&bar_done);
 }
 
 /* ==================================================================
@@ -369,14 +391,14 @@ static void step_adi_on(double complex buf[N][N], double dt_phys,
     dispatch(PHASE_HS1);
     dispatch(PHASE_HS2);
     cur_phase=PHASE_NORM;
-    pthread_barrier_wait(&bar_start);
-    pthread_barrier_wait(&bar_done);
+    barrier_wait(&bar_start);
+    barrier_wait(&bar_done);
     double norm=0;
     for(int t=0;t<NTHREADS;t++) norm+=partial_norm[t];
     norm=sqrt(norm*DX*DY);
     g_inv_norm=(norm>1e-12)?1.0/norm:1.0;
-    pthread_barrier_wait(&bar_start);
-    pthread_barrier_wait(&bar_done);
+    barrier_wait(&bar_start);
+    barrier_wait(&bar_done);
     g_psi = saved;
     if (time_acc) *time_acc += dt_phys;
 }
@@ -694,18 +716,27 @@ static void mathieu_evolve(double dt_phys)
 static bool video_start(void)
 {
     if (recording) return true;
+
+    /* Ignore SIGPIPE so a failed ffmpeg write doesn't kill the process */
+    signal(SIGPIPE, SIG_IGN);
+
     char cmd[512];
-    snprintf(cmd,sizeof cmd,
+    /* Log ffmpeg stderr to /tmp/ffmpeg_log.txt for diagnosis */
+    snprintf(cmd, sizeof cmd,
         "ffmpeg -y -f rawvideo -pixel_format rgb24"
         " -video_size %dx%d -framerate 30 -i pipe:0"
         " -vcodec libx264 -preset fast -crf 18 -pix_fmt yuv420p"
-        " output.mp4 2>/dev/null", SIM_W, SIM_H);
-    ffpipe=popen(cmd,"w");
-    if (!ffpipe){fprintf(stderr,"[Video] popen failed\n");return false;}
-    if (!rgb_buf) rgb_buf=malloc(SIM_W*SIM_H*3);
-    if (!rgb_buf){pclose(ffpipe);ffpipe=NULL;return false;}
-    recording=true;
-    printf("[Video] recording -> output.mp4\n"); fflush(stdout);
+        " output.mp4 2>/tmp/ffmpeg_log.txt", SIM_W, SIM_H);
+    ffpipe = popen(cmd, "w");
+    if (!ffpipe) {
+        fprintf(stderr, "[Video] popen failed: %s\n", strerror(errno));
+        return false;
+    }
+    if (!rgb_buf) rgb_buf = malloc(SIM_W * SIM_H * 3);
+    if (!rgb_buf) { pclose(ffpipe); ffpipe = NULL; return false; }
+    recording = true;
+    printf("[Video] recording -> output.mp4  (ffmpeg log: /tmp/ffmpeg_log.txt)\n");
+    fflush(stdout);
     return true;
 }
 static void video_stop(void)
@@ -724,7 +755,12 @@ static void video_frame(void)
         rgb_buf[k++]=(p>>8 )&0xFF;
         rgb_buf[k++]=(p    )&0xFF;
     }
-    fwrite(rgb_buf,1,SIM_W*SIM_H*3,ffpipe);
+    size_t written = fwrite(rgb_buf, 1, SIM_W*SIM_H*3, ffpipe);
+    if (written < (size_t)(SIM_W*SIM_H*3)) {
+        fprintf(stderr, "[Video] pipe broken — stopping. Check /tmp/ffmpeg_log.txt\n");
+        fflush(stderr);
+        pclose(ffpipe); ffpipe = NULL; recording = false;
+    }
 }
 
 /* ==================================================================

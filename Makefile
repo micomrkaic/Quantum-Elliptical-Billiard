@@ -1,53 +1,57 @@
 # Makefile -- Schrodinger elliptic billiard
 #
-# Linux:   make              (NTHREADS=4)
-#          make NTHREADS=8
-#   Requires: sudo apt install libsdl2-dev liblapacke-dev liblapack-dev libblas-dev libgsl-dev
+# Usage:
+#   Linux:   make [NTHREADS=8]
+#   macOS:   make [NTHREADS=10]
+#   (platform is auto-detected via uname)
 #
-# macOS:   make macos NTHREADS=10
-#   Requires: brew install sdl2 openblas gsl
+# Dependencies:
+#   Linux:  sudo apt install libsdl2-dev libgsl-dev
+#   macOS:  brew install sdl2 gsl openblas
 
 CC       = gcc
 CSTD     = -std=c17
 WARN     = -Wall -Wextra
 OPT      = -O2
 NTHREADS ?= 4
+TARGET   = schrodinger
 
-# ---- Linux -------------------------------------------------------
-SDL_CF  := $(shell sdl2-config --cflags)
-SDL_LF  := $(shell sdl2-config --libs)
+# ── auto-detect platform ──────────────────────────────────────────
+UNAME := $(shell uname)
 
-CFLAGS  = $(CSTD) $(WARN) $(OPT) -march=native \
-          -DNTHREADS=$(NTHREADS) \
-          -I/usr/include \
-          $(SDL_CF)
-LDFLAGS = $(SDL_LF) -llapacke -llapack -lblas -lgsl -lgslcblas -lm -lpthread
+ifeq ($(UNAME), Darwin)
+# ── macOS ─────────────────────────────────────────────────────────
+BREW     := $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)
+SDL_PRE  := $(shell brew --prefix sdl2    2>/dev/null || echo $(BREW)/opt/sdl2)
+GSL_PRE  := $(shell brew --prefix gsl     2>/dev/null || echo $(BREW)/opt/gsl)
+OB_PRE   := $(shell brew --prefix openblas 2>/dev/null || echo $(BREW)/opt/openblas)
 
-TARGET = schrodinger
+CFLAGS   = $(CSTD) $(WARN) $(OPT) -DNTHREADS=$(NTHREADS) \
+           -I$(SDL_PRE)/include \
+           -I$(GSL_PRE)/include \
+           -I$(OB_PRE)/include
+LDFLAGS  = -L$(SDL_PRE)/lib  -lSDL2 \
+           -L$(GSL_PRE)/lib  -lgsl -lgslcblas \
+           -L$(OB_PRE)/lib   -lopenblas \
+           -lm -lpthread
+
+else
+# ── Linux ─────────────────────────────────────────────────────────
+SDL_CF   := $(shell sdl2-config --cflags 2>/dev/null || echo -I/usr/include/SDL2 -D_REENTRANT)
+SDL_LF   := $(shell sdl2-config --libs   2>/dev/null || echo -lSDL2)
+
+CFLAGS   = $(CSTD) $(WARN) $(OPT) -march=native -DNTHREADS=$(NTHREADS) \
+           -I/usr/include \
+           $(SDL_CF)
+LDFLAGS  = $(SDL_LF) -lgsl -lgslcblas -lm -lpthread
+
+endif
 
 $(TARGET): schrodinger.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-	@echo "Built $(TARGET)  NTHREADS=$(NTHREADS)"
-
-# ---- macOS / Homebrew --------------------------------------------
-BREW_SDL := $(shell brew --prefix sdl2     2>/dev/null || echo /opt/homebrew/opt/sdl2)
-BREW_OB  := $(shell brew --prefix openblas 2>/dev/null || echo /opt/homebrew/opt/openblas)
-BREW_GSL := $(shell brew --prefix gsl      2>/dev/null || echo /opt/homebrew/opt/gsl)
-
-MACOS_CF = $(CSTD) $(WARN) $(OPT) -DNTHREADS=$(NTHREADS) \
-           -I$(BREW_SDL)/include/SDL2 \
-           -I$(BREW_OB)/include \
-           -I$(BREW_GSL)/include
-MACOS_LF = -L$(BREW_SDL)/lib -lSDL2 \
-           -L$(BREW_OB)/lib  -lopenblas \
-           -L$(BREW_GSL)/lib -lgsl -lgslcblas \
-           -lm -lpthread
-
-macos: schrodinger.c
-	$(CC) $(MACOS_CF) $< -o $(TARGET) $(MACOS_LF)
-	@echo "Built $(TARGET) [macOS]  NTHREADS=$(NTHREADS)"
+	@echo "Built $(TARGET)  [$(UNAME)]  NTHREADS=$(NTHREADS)"
 
 clean:
 	rm -f $(TARGET)
 
-.PHONY: clean macos
+.PHONY: clean
